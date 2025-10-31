@@ -1,0 +1,593 @@
+// ExpenseTrackerSwing.java
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+import javax.swing.table.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.text.*;
+import java.util.*;
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class ExpenseTrackerSwing {
+    // Config
+    private static final String APP_TITLE = "Expense Tracker — Multi User";
+    private static final String DATA_DIR = "user_data";
+    private static final String DATE_FMT = "yyyy-MM-dd";
+    private static final double HIGH_EXPENSE_THRESHOLD = 100.0;
+
+    public static void main(String[] args) {
+        try { Files.createDirectories(Paths.get(DATA_DIR)); } catch (IOException ignored) {}
+        SwingUtilities.invokeLater(() -> {
+            JFrame frame = new JFrame(APP_TITLE);
+            frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+            frame.setSize(1040, 720);
+            frame.setMinimumSize(new Dimension(920, 640));
+            frame.setLocationRelativeTo(null);
+            frame.setLayout(new BorderLayout());
+            new AppController(frame);
+            frame.setVisible(true);
+        });
+    }
+
+    // ------------------ Utilities ------------------
+    static String safeName(String name) {
+        if (name == null) return "user";
+        StringBuilder sb = new StringBuilder();
+        for (char ch : name.toCharArray()) {
+            if (Character.isLetterOrDigit(ch) || ch == '_' || ch == '-') sb.append(ch);
+        }
+        String s = sb.toString().trim();
+        return s.isEmpty() ? "user" : s;
+    }
+
+    static Path csvPath(String person) {
+        return Paths.get(DATA_DIR, "expenses_" + safeName(person) + ".csv");
+    }
+
+    static Path budgetPath(String person) {
+        return Paths.get(DATA_DIR, "budget_" + safeName(person) + ".txt");
+    }
+
+    static void ensureCsv(Path path) {
+        if (!Files.exists(path)) {
+            try (BufferedWriter w = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+                w.write("Date,Category,Amount,Description");
+                w.newLine();
+            } catch (IOException e) { e.printStackTrace(); }
+        }
+    }
+
+    static List<String[]> readRows(Path path) {
+        List<String[]> rows = new ArrayList<>();
+        if (!Files.exists(path)) return rows;
+        try (BufferedReader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            r.readLine(); // skip header
+            String line;
+            while ((line = r.readLine()) != null) {
+                String[] parts = line.split(",", -1);
+                if (parts.length < 4) {
+                    String[] arr = new String[4];
+                    Arrays.fill(arr, "");
+                    System.arraycopy(parts, 0, arr, 0, parts.length);
+                    parts = arr;
+                }
+                rows.add(parts);
+            }
+        } catch (IOException e) { e.printStackTrace(); }
+        return rows;
+    }
+
+    static void writeRows(Path path, List<String[]> rows) {
+        try (BufferedWriter w = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            w.write("Date,Category,Amount,Description");
+            w.newLine();
+            for (String[] r : rows) {
+                String[] q = new String[4];
+                for (int i = 0; i < 4; i++) {
+                    if (r[i] == null) r[i] = "";
+                    q[i] = r[i].contains(",") ? ("\"" + r[i].replace("\"", "\"\"") + "\"") : r[i];
+                }
+                w.write(String.join(",", q));
+                w.newLine();
+            }
+        } catch (IOException e) { e.printStackTrace(); }
+    }
+
+    static boolean validDate(String s) {
+        try {
+            SimpleDateFormat df = new SimpleDateFormat(DATE_FMT);
+            df.setLenient(false);
+            df.parse(s);
+            return true;
+        } catch (Exception ex) { return false; }
+    }
+
+    static Double tryDouble(String s) {
+        try { return Double.parseDouble(s); } catch (Exception ex) { return null; }
+    }
+
+    // ------------------ Controller ------------------
+    static class AppController {
+        private final JFrame frame;
+        private String person;
+        private Path filePath;
+        private TrackerPanel trackerPanel;
+
+        AppController(JFrame frame) {
+            this.frame = frame;
+            showLogin();
+        }
+
+        void showLogin() {
+            frame.getContentPane().removeAll();
+            LoginPanel lp = new LoginPanel(this);
+            frame.getContentPane().add(lp, BorderLayout.CENTER);
+            frame.revalidate();
+            frame.repaint();
+        }
+
+        void continueFromLogin(String name) {
+            if (name == null || name.trim().isEmpty()) {
+                JOptionPane.showMessageDialog(frame, "Please select a name.", "Name required", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            person = name.trim();
+            filePath = csvPath(person);
+            ensureCsv(filePath);
+            showTracker();
+        }
+
+        void showTracker() {
+            frame.getContentPane().removeAll();
+            trackerPanel = new TrackerPanel(this, person, filePath);
+            frame.getContentPane().add(trackerPanel, BorderLayout.CENTER);
+            frame.revalidate();
+            frame.repaint();
+        }
+
+        void switchBack() {
+            int res = JOptionPane.showConfirmDialog(frame, "Return to user selection?", "Switch user", JOptionPane.YES_NO_OPTION);
+            if (res == JOptionPane.YES_OPTION) showLogin();
+        }
+    }
+
+    // ------------------ Login Panel ------------------
+    static class LoginPanel extends JPanel {
+        LoginPanel(AppController controller) {
+            setLayout(new GridBagLayout());
+            setBorder(new EmptyBorder(20, 20, 20, 20));
+            GridBagConstraints c = new GridBagConstraints();
+            c.gridx = 0; c.gridy = 0; c.anchor = GridBagConstraints.WEST;
+
+            JLabel title = new JLabel("Select or type your username:");
+            title.setFont(title.getFont().deriveFont(Font.BOLD, 16f));
+            add(title, c);
+
+            c.gridy++;
+            c.insets = new Insets(10, 0, 0, 0);
+
+            // Dropdown of existing users
+            JComboBox<String> userBox = new JComboBox<>();
+            userBox.setEditable(true);
+            loadExistingUsers(userBox);
+            userBox.setPreferredSize(new Dimension(250, 25));
+            add(userBox, c);
+
+            c.gridy++;
+            c.insets = new Insets(8, 0, 0, 0);
+            JButton contBtn = new JButton("Continue →");
+            contBtn.setToolTipText("Create or open a profile for this user");
+            ExpenseTrackerSwing.stylePrimaryButton(contBtn, new Color(0x2563eb));
+            add(contBtn, c);
+
+            contBtn.addActionListener(e -> controller.continueFromLogin(userBox.getEditor().getItem().toString()));
+        }
+
+        private void loadExistingUsers(JComboBox<String> box) {
+            File dir = new File(DATA_DIR);
+            if (!dir.exists()) return;
+            File[] files = dir.listFiles((d, name) -> name.startsWith("expenses_") && name.endsWith(".csv"));
+            if (files == null) return;
+            for (File f : files) {
+                String uname = f.getName().replace("expenses_", "").replace(".csv", "");
+                box.addItem(uname);
+            }
+        }
+    }
+
+    // ------------------ Tracker Panel ------------------
+    static class TrackerPanel extends JPanel {
+        private final AppController controller;
+        private final String person;
+        private final Path file;
+        private Double budget = null;
+
+        private final DefaultTableModel tableModel;
+        private final JTable table;
+        private final TableRowSorter<TableModel> sorter;
+        private final JTextField dateField, catField, amtField, descField;
+        private final JTextField fCat, fDate, fSearch;
+        private final JLabel statusLabel;
+        private final JLabel budgetStatusLabel;
+        private final SimpleDateFormat dateFormat = new SimpleDateFormat(DATE_FMT);
+
+        TrackerPanel(AppController controller, String person, Path file) {
+            this.controller = controller;
+            this.person = person;
+            this.file = file;
+            dateFormat.setLenient(false);
+
+            setLayout(new BorderLayout(8, 8));
+            setBorder(new EmptyBorder(8, 8, 8, 8));
+
+            // Top Bar
+            JPanel top = new JPanel(new BorderLayout());
+            JPanel leftTop = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+            JLabel userLabel = new JLabel("\uD83D\uDC64  " + person);
+            userLabel.setFont(userLabel.getFont().deriveFont(Font.BOLD, 14f));
+            leftTop.add(userLabel);
+            top.add(leftTop, BorderLayout.WEST);
+
+            JPanel rightTop = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 4));
+            JButton backBtn = new JButton("← Switch User");
+            backBtn.setToolTipText("Go back to user selection");
+            ExpenseTrackerSwing.styleNeutralButton(backBtn, new Color(0x6b7280));
+            rightTop.add(backBtn);
+
+            rightTop.add(Box.createHorizontalStrut(8));
+            rightTop.add(new JLabel("Monthly Budget:"));
+            JTextField budField = new JTextField(8);
+            loadBudget(budField);
+            rightTop.add(budField);
+
+            JButton setBudBtn = new JButton("Set");
+            ExpenseTrackerSwing.stylePositiveButton(setBudBtn, new Color(0x059669));
+            rightTop.add(setBudBtn);
+
+            JButton refreshBudBtn = new JButton("Refresh");
+            ExpenseTrackerSwing.styleNeutralButton(refreshBudBtn, new Color(0x9ca3af));
+            rightTop.add(refreshBudBtn);
+
+            budgetStatusLabel = new JLabel("No budget set");
+            budgetStatusLabel.setForeground(new Color(0x555555));
+            rightTop.add(budgetStatusLabel);
+
+            top.add(rightTop, BorderLayout.EAST);
+            add(top, BorderLayout.NORTH);
+
+            // Tabs
+            JTabbedPane tabs = new JTabbedPane();
+
+            // Add/Edit Tab
+            JPanel addTab = new JPanel(new BorderLayout(8, 8));
+            JPanel form = new JPanel(new GridBagLayout());
+            GridBagConstraints g = new GridBagConstraints();
+            g.insets = new Insets(6, 6, 6, 6);
+            g.gridx = 0; g.gridy = 0; g.anchor = GridBagConstraints.WEST;
+
+            form.add(new JLabel("Date (YYYY-MM-DD)"), g);
+            g.gridx = 1;
+            dateField = new JTextField(dateFormat.format(new Date()), 12);
+            form.add(dateField, g);
+
+            g.gridx = 2;
+            form.add(new JLabel("Category"), g);
+            g.gridx = 3;
+            catField = new JTextField(16);
+            form.add(catField, g);
+
+            g.gridx = 0; g.gridy = 1;
+            form.add(new JLabel("Amount"), g);
+            g.gridx = 1;
+            amtField = new JTextField(12);
+            form.add(amtField, g);
+
+            g.gridx = 2;
+            form.add(new JLabel("Description"), g);
+            g.gridx = 3;
+            descField = new JTextField(36);
+            form.add(descField, g);
+
+            addTab.add(form, BorderLayout.NORTH);
+
+            JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 8));
+            JButton addBtn = new JButton("\uFF0B Add (Ctrl+N)");
+            ExpenseTrackerSwing.stylePrimaryButton(addBtn, new Color(0x2563eb));
+            btns.add(addBtn);
+
+            JButton updBtn = new JButton("\u270E Update");
+            ExpenseTrackerSwing.styleNeutralButton(updBtn, new Color(0xf59e0b));
+            btns.add(updBtn);
+
+            JButton delBtn = new JButton("\uD83D\uDDD1 Delete");
+            ExpenseTrackerSwing.styleDangerButton(delBtn, new Color(0xef4444));
+            btns.add(delBtn);
+
+            JButton expBtn = new JButton("\u21E9 Export CSV");
+            ExpenseTrackerSwing.styleNeutralButton(expBtn, new Color(0x7c3aed));
+            btns.add(expBtn);
+
+            addTab.add(btns, BorderLayout.CENTER);
+            tabs.addTab("Add / Edit", addTab);
+
+            // Browse Tab
+            JPanel browseTab = new JPanel(new BorderLayout(8, 8));
+            JPanel filters = new JPanel(new GridBagLayout());
+            filters.setBorder(BorderFactory.createTitledBorder("Quick Filters"));
+            GridBagConstraints fg = new GridBagConstraints();
+            fg.insets = new Insets(6, 6, 6, 6); fg.anchor = GridBagConstraints.WEST;
+
+            fg.gridx = 0; fg.gridy = 0;
+            filters.add(new JLabel("Category"), fg);
+            fg.gridx = 1;
+            fCat = new JTextField(12); filters.add(fCat, fg);
+            fg.gridx = 2;
+            filters.add(new JLabel("Date (YYYY-MM-DD)"), fg);
+            fg.gridx = 3;
+            fDate = new JTextField(12); filters.add(fDate, fg);
+            fg.gridx = 4;
+            filters.add(new JLabel("Search Description"), fg);
+            fg.gridx = 5;
+            fSearch = new JTextField(20); filters.add(fSearch, fg);
+            JButton applyBtn = new JButton("Apply");
+            ExpenseTrackerSwing.styleNeutralButton(applyBtn, new Color(0x0ea5e9));
+            fg.gridx = 6; filters.add(applyBtn, fg);
+
+            browseTab.add(filters, BorderLayout.NORTH);
+
+            String[] columns = {"Date", "Category", "Amount", "Description"};
+            tableModel = new DefaultTableModel(columns, 0) {
+                @Override public boolean isCellEditable(int row, int column) { return false; }
+            };
+            table = new JTable(tableModel);
+            table.setFillsViewportHeight(true);
+            table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+            table.setRowHeight(28);
+            table.getTableHeader().setReorderingAllowed(false);
+            sorter = new TableRowSorter<>(tableModel);
+            sorter.setComparator(2, (a, b) -> {
+                try { return Double.compare(Double.parseDouble(a.toString()), Double.parseDouble(b.toString())); } catch (Exception e) { return 0; }
+            });
+            sorter.setComparator(0, (a, b) -> {
+                try { return dateFormat.parse(a.toString()).compareTo(dateFormat.parse(b.toString())); } catch (Exception e) { return 0; }
+            });
+            table.setRowSorter(sorter);
+            table.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
+                private final Color odd = new Color(0xfafafa);
+                private final Color even = Color.WHITE;
+                private final Color high = new Color(0xfde2e2);
+                @Override
+                public Component getTableCellRendererComponent(JTable t, Object value, boolean isSelected, boolean hasFocus, int row, int col) {
+                    Component c = super.getTableCellRendererComponent(t, value, isSelected, hasFocus, row, col);
+                    int modelRow = t.convertRowIndexToModel(row);
+                    boolean isHigh = false;
+                    try { isHigh = Double.parseDouble(tableModel.getValueAt(modelRow, 2).toString()) > HIGH_EXPENSE_THRESHOLD; } catch (Exception ignored) {}
+                    if (isSelected) c.setBackground(t.getSelectionBackground()); else c.setBackground(isHigh ? high : (row % 2 == 0 ? even : odd));
+                    return c;
+                }
+            });
+
+            JScrollPane sp = new JScrollPane(table);
+            browseTab.add(sp, BorderLayout.CENTER);
+            tabs.addTab("Browse", browseTab);
+
+            // Reports Tab
+            JPanel reportsTab = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 8));
+            JButton monthlyBtn = new JButton("\uD83D\uDCC5 Monthly Summary");
+            ExpenseTrackerSwing.stylePositiveButton(monthlyBtn, new Color(0x16a34a));
+            JButton highestBtn = new JButton("\uD83C\uDFB7 Highest Category");
+            ExpenseTrackerSwing.styleNeutralButton(highestBtn, new Color(0xf59e0b));
+            JButton totalBtn = new JButton("\u03A3 Total Expenses");
+            ExpenseTrackerSwing.stylePrimaryButton(totalBtn, new Color(0x2563eb));
+            reportsTab.add(monthlyBtn); reportsTab.add(highestBtn); reportsTab.add(totalBtn);
+            tabs.addTab("Reports", reportsTab);
+
+            add(tabs, BorderLayout.CENTER);
+
+            // Status Bar
+            JPanel statusBar = new JPanel(new BorderLayout());
+            statusLabel = new JLabel("Ready.");
+            statusLabel.setBorder(new EmptyBorder(6, 10, 6, 10));
+            statusBar.add(statusLabel, BorderLayout.CENTER);
+            add(statusBar, BorderLayout.SOUTH);
+
+            // Load table
+            reloadTable();
+
+            // ---------- Actions ----------
+            addBtn.addActionListener(e -> onAdd());
+            delBtn.addActionListener(e -> onDelete());
+            updBtn.addActionListener(e -> onUpdateFromSelection());
+            expBtn.addActionListener(e -> onExport());
+            applyBtn.addActionListener(e -> reloadTable());
+            monthlyBtn.addActionListener(e -> onMonthlySummary());
+            highestBtn.addActionListener(e -> onHighestCategory());
+            totalBtn.addActionListener(e -> onTotal());
+
+            setBudBtn.addActionListener(e -> {
+                Double f = tryDouble(budField.getText().trim());
+                if (f == null) { JOptionPane.showMessageDialog(this, "Enter valid number."); return; }
+                budget = f; saveBudget(); updateBudgetStatus(); setStatus("Budget set to " + f);
+            });
+
+            refreshBudBtn.addActionListener(e -> {
+                budget = null; budField.setText(""); deleteBudget(); updateBudgetStatus(); setStatus("Budget cleared");
+            });
+
+            backBtn.addActionListener(e -> controller.switchBack());
+
+            fSearch.getDocument().addDocumentListener(new DocumentListener() {
+                public void insertUpdate(DocumentEvent e) { reloadTable(); }
+                public void removeUpdate(DocumentEvent e) { reloadTable(); }
+                public void changedUpdate(DocumentEvent e) { reloadTable(); }
+            });
+
+            // Keyboard shortcuts
+            InputMap im = getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW);
+            ActionMap am = getActionMap();
+            im.put(KeyStroke.getKeyStroke(KeyEvent.VK_N, InputEvent.CTRL_DOWN_MASK), "add");
+            am.put("add", new AbstractAction() { public void actionPerformed(ActionEvent e) { onAdd(); } });
+        }
+
+        private void onAdd() {
+            String date = dateField.getText().trim();
+            String cat = catField.getText().trim();
+            String amtS = amtField.getText().trim();
+            String desc = descField.getText().trim();
+
+            if (!validDate(date)) { JOptionPane.showMessageDialog(this, "Invalid date"); return; }
+            Double amt = tryDouble(amtS);
+            if (amt == null) { JOptionPane.showMessageDialog(this, "Invalid amount"); return; }
+            List<String[]> rows = readRows(file);
+            rows.add(new String[]{date, cat, amt.toString(), desc});
+            writeRows(file, rows);
+            setStatus("Added new expense");
+            reloadTable();
+        }
+
+        private void onUpdateFromSelection() {
+            int sel = table.getSelectedRow();
+            if (sel < 0) { JOptionPane.showMessageDialog(this, "Select a row first"); return; }
+            int modelRow = table.convertRowIndexToModel(sel);
+            String date = (String) tableModel.getValueAt(modelRow, 0);
+            String cat = (String) tableModel.getValueAt(modelRow, 1);
+            String amt = tableModel.getValueAt(modelRow, 2).toString();
+            String desc = (String) tableModel.getValueAt(modelRow, 3);
+
+            dateField.setText(date); catField.setText(cat); amtField.setText(amt); descField.setText(desc);
+            int res = JOptionPane.showConfirmDialog(this, "Update this entry?", "Confirm Update", JOptionPane.YES_NO_OPTION);
+            if (res != JOptionPane.YES_OPTION) return;
+
+            Double newAmt = tryDouble(amtField.getText().trim());
+            if (!validDate(dateField.getText().trim()) || newAmt == null) { JOptionPane.showMessageDialog(this, "Invalid input"); return; }
+
+            List<String[]> rows = readRows(file);
+            rows.set(modelRow, new String[]{dateField.getText().trim(), catField.getText().trim(), newAmt.toString(), descField.getText().trim()});
+            writeRows(file, rows);
+            setStatus("Updated entry");
+            reloadTable();
+        }
+
+        private void onDelete() {
+            int sel = table.getSelectedRow();
+            if (sel < 0) return;
+            int modelRow = table.convertRowIndexToModel(sel);
+            List<String[]> rows = readRows(file);
+            rows.remove(modelRow);
+            writeRows(file, rows);
+            setStatus("Deleted selected entry");
+            reloadTable();
+        }
+
+        private void onExport() {
+            JFileChooser fc = new JFileChooser();
+            fc.setSelectedFile(new File(person + "_export.csv"));
+            int res = fc.showSaveDialog(this);
+            if (res != JFileChooser.APPROVE_OPTION) return;
+            File f = fc.getSelectedFile();
+            try { Files.copy(file, f.toPath(), StandardCopyOption.REPLACE_EXISTING); setStatus("Exported CSV to " + f.getAbsolutePath()); }
+            catch (IOException e) { e.printStackTrace(); JOptionPane.showMessageDialog(this, "Error exporting"); }
+        }
+
+        private void onMonthlySummary() {
+            List<String[]> rows = readRows(file);
+            Map<String, Double> sum = new HashMap<>();
+            for (String[] r : rows) {
+                String m = r[0].substring(0, 7);
+                Double a = tryDouble(r[2]);
+                if (a == null) continue;
+                sum.put(m, sum.getOrDefault(m, 0.0) + a);
+            }
+            StringBuilder sb = new StringBuilder("Monthly Summary:\n");
+            sum.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(e -> sb.append(e.getKey()).append(": ").append(e.getValue()).append("\n"));
+            JOptionPane.showMessageDialog(this, sb.toString());
+        }
+
+        private void onHighestCategory() {
+            List<String[]> rows = readRows(file);
+            Map<String, Double> sum = new HashMap<>();
+            for (String[] r : rows) {
+                Double a = tryDouble(r[2]);
+                if (a == null) continue;
+                sum.put(r[1], sum.getOrDefault(r[1], 0.0) + a);
+            }
+            Optional<Map.Entry<String, Double>> max = sum.entrySet().stream().max(Map.Entry.comparingByValue());
+            JOptionPane.showMessageDialog(this, max.map(e -> "Highest: " + e.getKey() + " → " + e.getValue()).orElse("No data"));
+        }
+
+        private void onTotal() {
+            List<String[]> rows = readRows(file);
+            double sum = 0.0;
+            for (String[] r : rows) { Double a = tryDouble(r[2]); if (a != null) sum += a; }
+            JOptionPane.showMessageDialog(this, "Total Expenses: " + sum);
+        }
+
+        private void reloadTable() {
+            List<String[]> rows = readRows(file);
+            String catF = fCat.getText().trim().toLowerCase();
+            String dateF = fDate.getText().trim();
+            String searchF = fSearch.getText().trim().toLowerCase();
+
+            tableModel.setRowCount(0);
+            for (String[] r : rows) {
+                if (!catF.isEmpty() && !r[1].toLowerCase().contains(catF)) continue;
+                if (!dateF.isEmpty() && !r[0].contains(dateF)) continue;
+                if (!searchF.isEmpty() && !r[3].toLowerCase().contains(searchF)) continue;
+                tableModel.addRow(r);
+            }
+        }
+
+        private void setStatus(String s) { statusLabel.setText(s); }
+
+        private void loadBudget(JTextField f) {
+            Path bp = budgetPath(person);
+            if (!Files.exists(bp)) return;
+            try { String val = Files.readString(bp); budget = Double.parseDouble(val.trim()); f.setText(val); updateBudgetStatus(); }
+            catch (Exception ignored) {}
+        }
+
+        private void saveBudget() {
+            Path bp = budgetPath(person);
+            if (budget == null) return;
+            try { Files.writeString(bp, budget.toString()); } catch (IOException ignored) {}
+        }
+
+        private void deleteBudget() {
+            Path bp = budgetPath(person);
+            try { Files.deleteIfExists(bp); } catch (IOException ignored) {}
+        }
+
+        private void updateBudgetStatus() {
+            if (budget == null) budgetStatusLabel.setText("No budget set");
+            else {
+                double total = readRows(file).stream().mapToDouble(r -> { Double a = tryDouble(r[2]); return a == null ? 0.0 : a; }).sum();
+                double diff = budget - total;
+                budgetStatusLabel.setText(String.format("Budget remaining: %.2f", diff));
+            }
+        }
+    }
+
+    // ------------------ Button Styles ------------------
+    public static void stylePrimaryButton(JButton b, Color bg) {
+        b.setBackground(bg); b.setForeground(Color.WHITE);
+        b.setFocusPainted(false); b.setFont(b.getFont().deriveFont(Font.BOLD));
+    }
+    public static void styleNeutralButton(JButton b, Color bg) {
+        b.setBackground(bg); b.setForeground(Color.WHITE);
+        b.setFocusPainted(false); b.setFont(b.getFont().deriveFont(Font.PLAIN));
+    }
+    public static void stylePositiveButton(JButton b, Color bg) {
+        b.setBackground(bg); b.setForeground(Color.WHITE);
+        b.setFocusPainted(false); b.setFont(b.getFont().deriveFont(Font.BOLD));
+    }
+    public static void styleDangerButton(JButton b, Color bg) {
+        b.setBackground(bg); b.setForeground(Color.WHITE);
+        b.setFocusPainted(false); b.setFont(b.getFont().deriveFont(Font.BOLD));
+    }
+}
